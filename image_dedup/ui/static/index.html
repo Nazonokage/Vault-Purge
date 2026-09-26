@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Dedup · Photo review</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <aside>
+    <a class="brand" href="/">▧ <span>image<span class="accent">dedup</span></span></a>
+    <p class="eyebrow">YOUR LIBRARY, A LITTLE LIGHTER</p>
+    <nav aria-label="Views">
+      <button class="nav active" data-view="groups">▦ &nbsp; Duplicate groups</button>
+      <button class="nav" data-view="images">▧ &nbsp; All images</button>
+      <button class="nav" data-view="history">↶ &nbsp; Move history</button>
+    </nav>
+    <div class="filters">
+      <label>Scanned folder<select id="root"><option value="">All folders</option></select></label>
+      <label>Orientation<select id="orientation"><option value="">Every orientation</option><option>LANDSCAPE</option><option>PORTRAIT</option><option>SQUARE</option><option>UNKNOWN</option></select></label>
+      <label>Match type<select id="kind"><option value="">All matches</option><option value="exact">Exact copies</option><option value="near">Possible duplicates</option></select></label>
+      <label>Image status<select id="status"><option value="active">Available</option><option value="error">Unreadable</option><option value="missing">Missing</option><option value="moved">Moved to backup</option></select></label>
+      <label class="check"><input id="blurry" type="checkbox"> Only potentially blurry</label>
+    </div>
+    <button id="settings-open" class="secondary">⚙ Review settings</button>
+    <p class="aside-note">Local files. Manual decisions.<br>No permanent deletion.</p>
+  </aside>
+  <main>
+    <header><div><p class="eyebrow">PHOTO WORKSPACE</p><h1 id="title">Duplicate groups</h1><p id="subtitle">Make room for the photos that matter.</p></div><span id="mode" class="pill">Preview only</span></header>
+    <section class="scan-panel" aria-label="Scan a folder">
+      <form id="scan-form"><label for="folder">Folder to inspect</label><div class="input-row"><input id="folder" placeholder="D:\Photos\Holiday" required><button id="scan-button" type="submit">Scan folder <span>→</span></button></div>
+        <div class="scan-options"><label class="check"><input id="recursive" type="checkbox" checked> Include subfolders</label><label class="check"><input id="classify" type="checkbox"> Orientation only</label><label class="check"><input id="force" type="checkbox"> Re-analyze unchanged files</label></div>
+      </form><p id="scan-state" role="status">Choose a folder to begin. Scanning never moves your files.</p>
+    </section>
+    <section class="metrics" aria-label="Library summary"><div><span id="count-images">0</span><p>Available images</p></div><div><span id="count-blurry">0</span><p>Potentially blurry</p></div><div><span id="count-moved">0</span><p>Moved to backup</p></div><div><span id="count-errors">0</span><p>Unreadable files</p></div></section>
+    <div class="section-heading"><h2 id="result-label">Your review queue</h2><p id="result-count"></p></div>
+    <p id="message" role="alert" hidden></p>
+    <section id="results" aria-live="polite"></section>
+    <div class="pagination"><button id="prev" class="secondary">← Previous</button><span id="page"></span><button id="next" class="secondary">Next →</button></div>
+    <footer class="selection-bar"><div><strong id="selected-count">0 selected</strong><button id="clear" class="text-button">Clear selection</button></div><button id="preview" disabled>Preview moves →</button></footer>
+  </main>
+  <dialog id="settings-dialog"><form id="settings-form"><h2>Review settings</h2><p>Changes apply to this server session. Threshold changes reuse cached measurements.</p><label class="check"><input id="dry-run" type="checkbox" checked> Preview only — block moves and restores</label><label class="check"><input id="recommend" type="checkbox" checked> Highlight suggested keepers</label><label>Similarity threshold <input id="threshold" type="number" min="0" max="20" value="10" required><small>Lower is stricter. Possible duplicates always need review.</small></label><label>Blur threshold <input id="blur-threshold" type="number" min="0" step="0.1" value="100" required><small>Scores below this value are flagged. Smooth images can also score low.</small></label><div class="dialog-actions"><button type="button" class="secondary" data-close="settings-dialog">Cancel</button><button type="submit">Save settings</button></div></form></dialog>
+  <dialog id="move-dialog"><h2>Preview selected moves</h2><p>Review every destination. No image will be overwritten.</p><label>Backup directory<input id="destination" value="_duplicates_backup"><small>A relative path is inside each image’s scanned folder.</small></label><button id="refresh-preview" class="secondary">Build preview</button><p id="preview-note" role="status"></p><div id="preview-list"></div><div class="dialog-actions"><button class="secondary" data-close="move-dialog">Cancel</button><button id="confirm-move" disabled>Confirm moves</button></div></dialog>
+</body>
+</html>
