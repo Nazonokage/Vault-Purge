@@ -1,14 +1,53 @@
 """Journaled copy/verify/remove operations. No overwrite, no permanent delete API."""
 import os
+import platform
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlmodel import Session, select
 
-from image_dedup.core.hasher import md5_file
-from image_dedup.core.scanner import fingerprint
-from image_dedup.storage.models import ImageRecord, MoveRecord
+from vault_purge.core.hasher import md5_file
+from vault_purge.core.scanner import fingerprint
+from vault_purge.storage.models import ImageRecord, MoveRecord
+
+
+def reveal_file(path: str | Path) -> None:
+    target = Path(path).resolve()
+    if not target.exists() and not target.is_symlink():
+        raise FileNotFoundError(f"File not found: {target}")
+    system = platform.system()
+    if system == "Windows":
+        norm = os.path.normpath(str(target))
+        subprocess.Popen(f'explorer /select,"{norm}"')
+    elif system == "Darwin":
+        subprocess.Popen(["open", "-R", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target.parent)])
+
+
+def move_eligible(record):
+    return record and (record.status == "active" or (record.status == "error" and record.integrity == "suspect"))
+
+
+def suggest_destination(session, ids):
+    records = [session.get(ImageRecord, image_id) for image_id in ids]
+    if not records or not all(move_eligible(record) for record in records):
+        raise ValueError("Select available files first")
+    roots = {Path(record.root) for record in records}
+    if len(roots) != 1:
+        raise ValueError("Select files from one scanned folder, or enter a destination manually")
+    root = roots.pop()
+    if root == root.parent:
+        raise ValueError("A drive root has no sibling folder. Choose a destination on this or another drive.")
+    suffix = "_corrupt_review" if any(record.integrity == "suspect" for record in records) else "_moved"
+    candidate = root.parent / (root.name + suffix)
+    number = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = root.parent / f"{root.name}{suffix}_{number}"
+        number += 1
+    return str(candidate)
 
 
 def checked_source(record):
@@ -31,7 +70,7 @@ def preview_moves(session, ids, destination):
     destinations = set()
     for image_id in ids:
         record = session.get(ImageRecord, image_id)
-        if not record or record.status != "active":
+        if not move_eligible(record):
             raise ValueError(f"Image {image_id} is not available")
         source = checked_source(record)
         root = Path(record.root)
@@ -49,7 +88,7 @@ def preview_moves(session, ids, destination):
         destinations.add(str(target).casefold())
         plans.append(dict(id=image_id, source=str(source), destination=str(target),
                           size=record.size, mtime_ns=record.mtime_ns, ctime_ns=record.ctime_ns,
-                          md5=record.md5 or md5_file(source)))
+                          md5=record.md5 or md5_file(source), integrity=record.integrity, reason=record.error))
     return plans
 
 
@@ -77,7 +116,7 @@ def execute_moves(engine, plans):
         # Check the complete plan before the first change.
         for plan in plans:
             record = session.get(ImageRecord, plan["id"])
-            if not record or record.status != "active":
+            if not move_eligible(record):
                 raise ValueError("Selection is stale; create a new preview")
             checked_source(record)
             if (record.size, record.mtime_ns, record.ctime_ns) != (plan["size"], plan["mtime_ns"], plan["ctime_ns"]):
@@ -103,6 +142,7 @@ def execute_moves(engine, plans):
                 move.error = str(exc)
             session.add(move)
             session.commit()
+            session.refresh(move)
             results.append(move.model_dump())
             if move.state == "attention":
                 break
@@ -126,7 +166,7 @@ def restore_move(engine, move_id):
             transfer(source, target, move.md5)
             record = session.get(ImageRecord, move.image_id)
             record.size, record.mtime_ns, record.ctime_ns = fingerprint(target)
-            record.status = "active"
+            record.status = "error" if record.error else "active"
             record.user_decision = "restored"
             move.state = "restored"
             session.add(record)
@@ -135,6 +175,7 @@ def restore_move(engine, move_id):
             move.error = str(exc)
         session.add(move)
         session.commit()
+        session.refresh(move)
         return move.model_dump()
 
 
@@ -148,7 +189,7 @@ def recover_journal(engine):
             record = session.get(ImageRecord, move.image_id)
             if not source.exists() and target.is_file() and not target.is_symlink() and md5_file(target) == move.md5:
                 move.state = "restored" if restoring else "moved"
-                record.status = "active" if restoring else "moved"
+                record.status = ("error" if record.error else "active") if restoring else "moved"
                 if restoring:
                     record.size, record.mtime_ns, record.ctime_ns = fingerprint(target)
                 session.add(record)

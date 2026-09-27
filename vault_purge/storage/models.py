@@ -18,6 +18,11 @@ class ImageRecord(SQLModel, table=True):
     status: str = Field(default="active", index=True)
     error: str | None = None
     user_decision: str | None = None
+    media_type: str = Field(default="image", index=True)
+    duration: float | None = None
+    fps: float | None = None
+    frame_hashes: str | None = None
+    integrity: str = "unchecked"
 
 
 class MoveRecord(SQLModel, table=True):
@@ -29,3 +34,21 @@ class MoveRecord(SQLModel, table=True):
     state: str = "pending"
     created_at: str
     error: str | None = None
+
+
+class ScanRecord(SQLModel, table=True):
+    __table_args__ = {"sqlite_autoincrement": True}
+    id: int | None = Field(default=None, primary_key=True)
+    root: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    state: str = "running"
+    recursive: bool = True
+    classify_only: bool = False
+    stats_json: str | None = None
+    error: str | None = None
+
+
+class ScanMember(SQLModel, table=True):
+    scan_id: int = Field(primary_key=True)
+    image_id: int = Field(primary_key=True)

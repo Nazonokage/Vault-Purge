@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="IMAGE_DEDUP_", env_file=".env", extra="ignore")
-    database: Path = Path(".image_dedup/cache.sqlite3")
+    model_config = SettingsConfigDict(env_prefix="vault_purge_", env_file=".env", extra="ignore")
+    database: Path = Path(".vault_purge/cache.sqlite3")
     dry_run: bool = True
     dest_folder: str = "_duplicates_backup"
     show_recommendation: bool = True

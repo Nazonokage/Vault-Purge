@@ -4,22 +4,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, delete
 from sqlmodel import Session, select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from image_dedup.api.settings import Settings
-from image_dedup.core.grouper import group_images
-from image_dedup.core.scanner import fingerprint, scan
-from image_dedup.storage.database import open_database
-from image_dedup.storage.models import ImageRecord, MoveRecord
-from image_dedup.utils.file_ops import execute_moves, preview_moves, recover_journal, restore_move
-from image_dedup.utils.thumb_cache import thumbnail
+from vault_purge.api.settings import Settings
+from vault_purge.core.grouper import group_images
+from vault_purge.core.scanner import fingerprint, scan
+from vault_purge.storage.database import open_database
+from vault_purge.storage.models import ImageRecord, MoveRecord, ScanRecord, ScanMember
+from vault_purge.utils.file_ops import execute_moves, preview_moves, recover_journal, restore_move, reveal_file, suggest_destination
+from vault_purge.utils.thumb_cache import thumbnail
+from vault_purge.utils.folders import browse_folders
+
+SortOrder = Literal["name", "size_desc", "size_asc", "newest", "oldest", "blur", "duration"]
 
 
 class ScanRequest(BaseModel):
@@ -37,6 +41,11 @@ class PreviewRequest(BaseModel):
 class ConfirmRequest(BaseModel):
     token: str
     confirm: bool = False
+    allow_move: bool = False
+
+
+class DestinationRequest(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=10000)
 
 
 class Preferences(BaseModel):
@@ -54,7 +63,7 @@ def create_app(settings: Settings | None = None):
     lock = threading.Lock()
     token = secrets.token_urlsafe(32)
     previews = {}
-    job = {"state": "idle", "stats": None, "error": None}
+    job = {"state": "idle", "stats": None, "error": None, "scan_id": None}
     group_cache = {}
 
     @asynccontextmanager
@@ -91,6 +100,33 @@ def create_app(settings: Settings | None = None):
         previews.clear()
         thumbnail.cache_clear()
 
+    def scan_filter(scan_id):
+        with Session(engine) as session:
+            if not session.get(ScanRecord, scan_id):
+                raise HTTPException(404, "Scan history entry was cleared or does not exist")
+        return ImageRecord.id.in_(select(ScanMember.image_id).where(ScanMember.scan_id == scan_id))
+
+    @app.get("/api/scans")
+    def scan_history(offset: int = Query(0, ge=0), limit: int = Query(48, ge=1, le=200)):
+        with Session(engine) as session:
+            total = session.exec(select(func.count()).select_from(ScanRecord)).one()
+            rows = session.exec(select(ScanRecord).order_by(ScanRecord.id.desc()).offset(offset).limit(limit)).all()
+            return {"total": total, "items": rows}
+
+    @app.delete("/api/scans")
+    def clear_scan_history():
+        require_lock()
+        try:
+            with Session(engine) as session:
+                session.exec(delete(ScanMember))
+                session.exec(delete(ScanRecord))
+                session.commit()
+            job.update(state="idle", stats=None, error=None, scan_id=None)
+            invalidate()
+            return {"cleared": True}
+        finally:
+            lock.release()
+
     @app.get("/api/settings")
     def get_settings():
         return {**settings.model_dump(mode="json"), "session_token": token}
@@ -110,20 +146,28 @@ def create_app(settings: Settings | None = None):
     def scan_status():
         return job.copy()
 
+    @app.post("/api/folders")
+    def folders(path: str | None = None, offset: int = Query(0, ge=0)):
+        try:
+            return browse_folders(path, offset)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(400, f"Cannot browse this folder: {exc}")
+
     @app.post("/api/scan", status_code=202)
     def start_scan(body: ScanRequest):
         path = Path(body.path).expanduser()
         if not path.is_dir():
             raise HTTPException(400, "Choose an existing directory")
         require_lock()
-        job.update(state="running", stats=None, error=None)
+        job.update(state="running", stats=None, error=None, scan_id=None)
         invalidate()
 
         def run():
             try:
                 stats = scan(path, engine, workers=settings.workers, classify_only=body.classify_only,
                              recursive=body.recursive, force=body.force,
-                             progress=lambda stats: job.update(stats=stats.copy()))
+                             progress=lambda stats: job.update(stats=stats.copy()),
+                             on_started=lambda scan_id: job.update(scan_id=scan_id))
                 job.update(state="complete", stats=stats)
             except Exception as exc:
                 job.update(state="error", error=str(exc))
@@ -134,51 +178,87 @@ def create_app(settings: Settings | None = None):
         return {"state": "running"}
 
     @app.get("/api/summary")
-    def summary():
+    def summary(scan_id: int | None = None):
         with Session(engine) as session:
-            counts = dict(session.exec(select(ImageRecord.status, func.count()).group_by(ImageRecord.status)).all())
-            roots = session.exec(select(ImageRecord.root).distinct()).all()
-            blurry = session.exec(select(func.count()).select_from(ImageRecord).where(ImageRecord.status == "active", ImageRecord.blur_score < settings.blur_threshold)).one()
+            condition = scan_filter(scan_id) if scan_id is not None else True
+            counts = dict(session.exec(select(ImageRecord.status, func.count()).where(condition).group_by(ImageRecord.status)).all())
+            roots = session.exec(select(ImageRecord.root).where(condition).distinct()).all()
+            blurry = session.exec(select(func.count()).select_from(ImageRecord).where(condition, ImageRecord.status == "active", ImageRecord.blur_score < settings.blur_threshold)).one()
             return {"counts": counts, "roots": roots, "blurry": blurry}
 
     @app.get("/api/images")
     def images(orientation: str | None = None, status: str = "active", blurry: bool = False,
-               root: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=200)):
+               scan_id: int | None = None,
+               integrity: Literal["unchecked", "checked", "sampled", "suspect", "unreadable"] | None = None,
+               root: str | None = None, media_type: Literal["image", "video"] | None = None,
+               sort: SortOrder = "name", offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=200)):
         query = select(ImageRecord).where(ImageRecord.status == status)
+        if scan_id is not None:
+            query = query.where(scan_filter(scan_id))
         if orientation:
             query = query.where(ImageRecord.orientation == orientation)
         if root:
             query = query.where(ImageRecord.root == root)
         if blurry:
             query = query.where(ImageRecord.blur_score < settings.blur_threshold)
+        if media_type:
+            query = query.where(ImageRecord.media_type == media_type)
+        if integrity:
+            query = query.where(ImageRecord.integrity == integrity)
+        ordering = {"name": ImageRecord.path, "size_desc": ImageRecord.size.desc(), "size_asc": ImageRecord.size,
+                    "newest": ImageRecord.mtime_ns.desc(), "oldest": ImageRecord.mtime_ns,
+                    "blur": ImageRecord.blur_score.asc().nulls_last(), "duration": ImageRecord.duration.desc().nulls_last()}[sort]
         with Session(engine) as session:
             total = session.exec(select(func.count()).select_from(query.subquery())).one()
-            return {"total": total, "items": session.exec(query.order_by(ImageRecord.path).offset(offset).limit(limit)).all()}
+            return {"total": total, "items": session.exec(query.order_by(ordering, ImageRecord.path, ImageRecord.id).offset(offset).limit(limit)).all()}
 
     @app.get("/api/groups")
     def groups(root: str | None = None, kind: str | None = None, orientation: str | None = None,
+               scan_id: int | None = None,
+               media_type: Literal["image", "video"] | None = None, sort: SortOrder = "name",
                offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
         if lock.locked():
             raise HTTPException(409, "Wait for the current operation to finish")
-        key = (root, settings.phash_threshold)
+        condition = scan_filter(scan_id) if scan_id is not None else True
+        key = (root, settings.phash_threshold, scan_id)
         if key not in group_cache:
             with Session(engine) as session:
-                query = select(ImageRecord).where(ImageRecord.status == "active")
+                query = select(ImageRecord).where(ImageRecord.status == "active", condition)
                 if root:
                     query = query.where(ImageRecord.root == root)
                 result = group_images(session.exec(query).all(), settings.phash_threshold)
                 group_cache[key] = [{**g, "members": [r.model_dump() for r in g["members"]]} for g in result]
         result = [g for g in group_cache[key] if (not kind or g["kind"] == kind)
-                  and (not orientation or any(r["orientation"] == orientation for r in g["members"]))]
+                  and (not orientation or any(r["orientation"] == orientation for r in g["members"]))
+                  and (not media_type or g["members"][0]["media_type"] == media_type)]
+        def sort_group(group):
+            members = group["members"]
+            value = {"name": min(r["path"] for r in members),
+                     "size_desc": -sum(r["size"] for r in members), "size_asc": sum(r["size"] for r in members),
+                     "newest": -max(r["mtime_ns"] for r in members), "oldest": min(r["mtime_ns"] for r in members),
+                     "blur": min((r["blur_score"] for r in members if r["blur_score"] is not None), default=float("inf")),
+                     "duration": -max((r["duration"] or 0 for r in members), default=0)}[sort]
+            return value, group["id"]
+        result.sort(key=sort_group)
         return {"total": len(result), "items": result[offset:offset + limit]}
 
     @app.get("/thumb/{image_id}")
     def thumb(image_id: int):
         with Session(engine) as session:
             record = session.get(ImageRecord, image_id)
-            if not record or record.status != "active":
+            if not record:
                 raise HTTPException(404, "Image unavailable")
             path = Path(record.path)
+            if not path.exists() and record.status == "moved":
+                move = session.exec(
+                    select(MoveRecord)
+                    .where(MoveRecord.image_id == image_id, MoveRecord.state == "moved")
+                    .order_by(MoveRecord.id.desc())
+                ).first()
+                if move and Path(move.destination).exists():
+                    path = Path(move.destination)
+            if record.status not in {"active", "moved"} and not path.exists():
+                raise HTTPException(404, "Image unavailable")
             try:
                 if path.is_symlink() or path.resolve() != path:
                     raise ValueError("Image path changed")
@@ -203,9 +283,17 @@ def create_app(settings: Settings | None = None):
         finally:
             lock.release()
 
+    @app.post("/api/move/destination")
+    def destination(body: DestinationRequest):
+        try:
+            with Session(engine) as session:
+                return {"destination": suggest_destination(session, body.ids)}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc))
+
     @app.post("/api/move")
     def move(body: ConfirmRequest):
-        if settings.dry_run or not body.confirm:
+        if (settings.dry_run and not body.allow_move) or not body.confirm:
             raise HTTPException(400, "Disable preview-only mode and explicitly confirm first")
         require_lock()
         try:
@@ -236,6 +324,45 @@ def create_app(settings: Settings | None = None):
         finally:
             invalidate()
             lock.release()
+
+    @app.post("/api/images/{image_id}/reveal")
+    def reveal_image(image_id: int):
+        with Session(engine) as session:
+            record = session.get(ImageRecord, image_id)
+            if not record:
+                raise HTTPException(404, "Media record not found")
+            path = Path(record.path)
+            if not path.exists():
+                move = session.exec(
+                    select(MoveRecord)
+                    .where(MoveRecord.image_id == image_id, MoveRecord.state == "moved")
+                    .order_by(MoveRecord.id.desc())
+                ).first()
+                if move and Path(move.destination).exists():
+                    path = Path(move.destination)
+                else:
+                    raise HTTPException(404, "File does not exist on disk")
+            try:
+                reveal_file(path)
+            except Exception as exc:
+                raise HTTPException(500, f"Failed to reveal file: {exc}")
+            return {"revealed": True, "path": str(path)}
+
+    @app.post("/api/moves/{move_id}/reveal")
+    def reveal_move(move_id: int, target: Literal["original", "destination"] = "destination"):
+        with Session(engine) as session:
+            move = session.get(MoveRecord, move_id)
+            if not move:
+                raise HTTPException(404, "Move record not found")
+            path_str = move.destination if target == "destination" else move.original
+            path = Path(path_str)
+            if not path.exists():
+                raise HTTPException(404, f"File does not exist on disk: {path_str}")
+            try:
+                reveal_file(path)
+            except Exception as exc:
+                raise HTTPException(500, f"Failed to reveal file: {exc}")
+            return {"revealed": True, "path": str(path)}
 
     static = Path(__file__).resolve().parents[1] / "ui" / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")

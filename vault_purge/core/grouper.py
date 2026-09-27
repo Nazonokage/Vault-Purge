@@ -1,5 +1,5 @@
 from collections import defaultdict
-from image_dedup.core.resolver import recommend
+from vault_purge.core.resolver import recommend
 
 
 class BKTree:
@@ -35,19 +35,21 @@ def group_images(records, threshold=10):
     exact = defaultdict(list)
     for record in records:
         if record.md5:
-            exact[record.md5].append(record)
+            exact[(record.media_type, record.md5)].append(record)
     groups = []
-    for digest, members in sorted(exact.items()):
+    for (media_type, digest), members in sorted(exact.items()):
         if len(members) > 1:
-            groups.append(dict(id=f"exact-{digest}", kind="exact", members=members, recommendation=recommend(members)))
+            groups.append(dict(id=f"exact-{media_type}-{digest}", kind="exact", members=members, recommendation=recommend(members)))
     # Anchor groups: every member is within threshold of its anchor. No transitive chains.
-    tree = BKTree()
+    trees = {"image": BKTree(), "video": BKTree()}
     near = {}
     for record in records:
         if not record.phash:
             continue
         value = int(record.phash, 16)
-        candidates = list(tree.find(value, threshold))
+        tree = trees[record.media_type]
+        candidates = [candidate for candidate in tree.find(value, threshold)
+                      if record.media_type != "video" or videos_match(record, candidate, threshold)]
         if candidates:
             anchor = min(candidates, key=lambda a: ((value ^ int(a.phash, 16)).bit_count(), a.path))
             near[anchor.id].append(record)
@@ -58,3 +60,12 @@ def group_images(records, threshold=10):
         if len(members) > 1 and len({r.md5 or r.path for r in members}) > 1:
             groups.append(dict(id=f"near-{anchor_id}", kind="near", anchor_id=anchor_id, members=members, recommendation=recommend(members)))
     return groups
+
+
+def videos_match(left, right, threshold):
+    if not left.duration or not right.duration or not left.frame_hashes or not right.frame_hashes:
+        return False
+    if abs(left.duration - right.duration) > max(.25, min(left.duration, right.duration) * .01):
+        return False
+    a, b = left.frame_hashes.split(","), right.frame_hashes.split(",")
+    return len(a) == len(b) == 3 and all((int(x, 16) ^ int(y, 16)).bit_count() <= threshold for x, y in zip(a, b))

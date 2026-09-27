@@ -2,7 +2,11 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+.vault_purge/
 .image_dedup/
 _duplicates_backup/
 .env
 dist/
+build/
+*.spec
+tmp_pytest/
