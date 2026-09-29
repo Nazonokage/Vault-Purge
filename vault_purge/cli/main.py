@@ -3,18 +3,18 @@ from typing import Annotated
 import json
 
 import typer
-import uvicorn
 from rich.console import Console
 from rich.table import Table
 from sqlmodel import Session, select
 
-from vault_purge.api.settings import Settings
+from vault_purge.api.settings import DEFAULT_PORT, Settings
+from vault_purge.api.runtime import run_server
 from vault_purge.core.grouper import group_images
 from vault_purge.core.scanner import scan as scan_folder
 from vault_purge.storage.database import open_database
 from vault_purge.storage.models import ImageRecord
 
-app = typer.Typer(no_args_is_help=True, help="Find duplicate images and videos, with advisory blur scores. Moves are manual.")
+app = typer.Typer(no_args_is_help=True, help="Find duplicate images, videos, and audio. Moves are manual.")
 console = Console()
 
 
@@ -55,12 +55,12 @@ def scan(path: Annotated[Path, typer.Option(exists=True, file_okay=False, help="
         engine.dispose()
     if serve:
         from vault_purge.api.server import create_app
-        console.print("Open http://127.0.0.1:8000 in your browser")
-        uvicorn.run(create_app(settings), host="127.0.0.1", port=8000)
+        console.print(f"Open http://127.0.0.1:{DEFAULT_PORT} in your browser")
+        run_server(create_app(settings), settings, DEFAULT_PORT)
 
 
 @app.command()
-def serve(database: Path | None = None, port: Annotated[int, typer.Option(min=1024, max=65535)] = 8000,
+def serve(database: Path | None = None, port: Annotated[int, typer.Option(min=1024, max=65535)] = DEFAULT_PORT,
           open_browser: bool = True):
     """Open the local review server. You can start scans from its browser UI."""
     import threading
@@ -73,7 +73,7 @@ def serve(database: Path | None = None, port: Annotated[int, typer.Option(min=10
     console.print(f"Open [bold green]{url}[/bold green] in your browser")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    uvicorn.run(create_app(settings), host="127.0.0.1", port=port)
+    run_server(create_app(settings), settings, port)
 
 
 @app.command()
@@ -91,6 +91,8 @@ def report(database: Path | None = None, path: Path | None = None, output: Path 
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+    freeze_support()
     import sys
     if len(sys.argv) == 1:
         serve()

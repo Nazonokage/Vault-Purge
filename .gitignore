@@ -10,3 +10,6 @@ dist/
 build/
 *.spec
 tmp_pytest/
+vault_purge/media_tools/*.exe
+terminal repot.md
+

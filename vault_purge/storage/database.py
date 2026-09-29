@@ -16,7 +16,7 @@ def open_database(path: Path):
     # Explicit schema version; future releases must migrate rather than silently reuse it.
     with engine.begin() as connection:
         version = connection.exec_driver_sql("PRAGMA user_version").scalar()
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise RuntimeError(f"Unsupported database schema {version}")
     SQLModel.metadata.create_all(engine)
     with engine.begin() as connection:
@@ -25,9 +25,15 @@ def open_database(path: Path):
             if name not in columns:
                 connection.exec_driver_sql(f"ALTER TABLE imagerecord ADD COLUMN {name} {declaration}")
         connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_imagerecord_media_type ON imagerecord(media_type)")
+        for name, declaration in {"codec": "TEXT", "sample_rate": "INTEGER", "channels": "INTEGER",
+                                  "audio_fingerprint": "TEXT", "audio_version": "INTEGER NOT NULL DEFAULT 0",
+                                  "analysis_note": "TEXT", "segments_json": "TEXT",
+                                  "segments_version": "INTEGER NOT NULL DEFAULT 0"}.items():
+            if name not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE imagerecord ADD COLUMN {name} {declaration}")
         if version < 4:
             # Older caches did not record scan dates. Keep them explicitly labelled.
             connection.exec_driver_sql("INSERT INTO scanrecord (root, state, recursive, classify_only) SELECT DISTINCT root, 'legacy', 1, 0 FROM imagerecord")
             connection.exec_driver_sql("INSERT INTO scanmember (scan_id, image_id) SELECT s.id, i.id FROM scanrecord s JOIN imagerecord i ON s.root = i.root WHERE s.state = 'legacy'")
-        connection.exec_driver_sql("PRAGMA user_version=4")
+        connection.exec_driver_sql("PRAGMA user_version=5")
     return engine

@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0] - 2026-09-29
+
+- Changed the default local port from 8000 to 47831 for both `serve` and `scan --serve`; custom `--port` remains supported.
+- Added a Mermaid architecture chart and offline-operation details to the README.
+
+- Interrupted or stopped scan workers now end scan history as interrupted instead of leaving it running or labelling media as bad. The API releases its operation lock after a worker interrupt.
+- Python and packaged server launches now write a rotating `diagnostics.log` beside the database, recording lifecycle, process IDs, exceptions, and shutdown signals. Signal sender identity is not available from the handler.
+
+- Added animated scan feedback, elapsed time, cache/discovery progress, and separate results-preparation feedback.
+- Added audio discovery, metadata, full-stream integrity decoding, exact-copy review, local music fingerprints, and audio-aware cache/recommendation rules.
+- Added audio/video players, seeking, on-demand compatible previews, and a bounded conversion cache.
+- Added experimental two-file shared-segment comparison with separate visual/audio time ranges, a 30-minute analysis cap, and cached measurements.
+- Added schema v5 migration while retaining existing records and history.
+- Added pinned, checksum-verified FFmpeg/ffprobe and Chromaprint preparation and Windows executable bundling, including upstream notices.
+- Added generated-media tests for re-encoding, trim/reorder detection, preview serving, cache reuse, integrity failures, and audio move/restore. Broader real-media matching calibration and public redistribution source materials remain pending.
+- Fixed 404 logs for browser `/favicon.ico` requests and suppressed unhandled `ConnectionResetError` (WinError 10054) on Windows asyncio proactor socket teardown when streaming media.
+
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

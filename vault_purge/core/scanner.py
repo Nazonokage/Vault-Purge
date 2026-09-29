@@ -2,17 +2,28 @@ import os
 import json
 from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 from sqlmodel import Session, select
 
 from vault_purge.core.hasher import ANALYSIS_VERSION, analyze_media, md5_file
 from vault_purge.core.video import VIDEO_EXTENSIONS
+from vault_purge.core.audio import AUDIO_EXTENSIONS, AUDIO_VERSION
 from vault_purge.core.integrity import failure_kind
 from vault_purge.storage.models import ImageRecord, MoveRecord, ScanRecord, ScanMember
 
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 EXTENSIONS |= VIDEO_EXTENSIONS
+EXTENSIONS |= AUDIO_EXTENSIONS
+
+
+def analysis_complete(record):
+    if not record.md5:
+        return False
+    if record.media_type == "audio":
+        return record.integrity == "checked" and record.audio_version == AUDIO_VERSION
+    return record.blur_score is not None and (record.phash or record.media_type == "video")
 
 
 def fingerprint(path: Path) -> tuple[int, int, int]:
@@ -47,10 +58,12 @@ def scan(root: Path, engine, workers=4, classify_only=False, recursive=True, for
         if on_started:
             on_started(scan_id)
         stats = _scan(root, engine, workers, classify_only, recursive, force, progress, scan_id)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         with Session(engine) as session:
             history = session.get(ScanRecord, scan_id)
-            history.state, history.error = "error", str(exc)
+            history.state = "interrupted" if isinstance(exc, (KeyboardInterrupt, BrokenProcessPool)) else "error"
+            history.error = ("Scan interrupted: an analysis worker or the server was stopped. Restart and scan again; completed batches remain cached."
+                             if history.state == "interrupted" else str(exc))
             history.finished_at = datetime.now(timezone.utc).isoformat()
             session.add(history)
             session.commit()
@@ -69,6 +82,10 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
     if not root.is_dir():
         raise ValueError("Scan path must be a directory")
     stats = dict(found=0, cached=0, analyzed=0, errors=0)
+    def report():
+        if progress:
+            progress(stats.copy())
+    report()
     seen = set()
     with Session(engine) as session:
         previous = {r.path: r for r in session.exec(select(ImageRecord).where(ImageRecord.root == str(root)))}
@@ -90,6 +107,9 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
                         record.error = None
                         record.status = "active"
                         stats["analyzed"] += 1
+                    except BrokenProcessPool:
+                        # A stopped worker is not evidence that a media file is bad.
+                        raise
                     except Exception as exc:
                         record.error = str(exc)
                         record.status = "error"
@@ -107,18 +127,21 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
 
             for path in walk_images(root, excluded, recursive):
                 stats["found"] += 1
+                report()
                 seen.add(str(path))
                 try:
                     signature = fingerprint(path)
                 except OSError:
                     stats["errors"] += 1
+                    report()
                     continue
                 record = previous.get(str(path)) or session.exec(select(ImageRecord).where(ImageRecord.path == str(path))).first()
-                if record and not force and record.status == "active" and record.version == ANALYSIS_VERSION and (record.size, record.mtime_ns, record.ctime_ns) == signature and (classify_only or (record.md5 and record.blur_score is not None and (record.phash or record.media_type == "video"))):
+                if record and not force and record.status == "active" and record.version == ANALYSIS_VERSION and (record.size, record.mtime_ns, record.ctime_ns) == signature and (classify_only or analysis_complete(record)):
                     record.root = str(root)
                     session.add(record)
                     session.add(ScanMember(scan_id=scan_id, image_id=record.id))
                     stats["cached"] += 1
+                    report()
                     continue
                 if record is None:
                     record = ImageRecord(root=str(root), path=str(path), size=signature[0], mtime_ns=signature[1], ctime_ns=signature[2])
@@ -126,7 +149,10 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
                 record.size, record.mtime_ns, record.ctime_ns = signature
                 record.version = ANALYSIS_VERSION
                 record.integrity = "unchecked"
-                record.media_type = "video" if path.suffix.lower() in VIDEO_EXTENSIONS else "image"
+                record.media_type = "video" if path.suffix.lower() in VIDEO_EXTENSIONS else "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "image"
+                record.audio_fingerprint = record.analysis_note = record.segments_json = None
+                record.audio_version = record.segments_version = 0
+                record.codec = record.channels = record.sample_rate = None
                 record.frame_hashes = None
                 record.duration = record.fps = None
                 record.phash = None
@@ -140,4 +166,5 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
                 record.status = "missing"
                 session.add(record)
         session.commit()
+    report()
     return stats

@@ -56,5 +56,8 @@ def analyze_image(path: str, hashing: bool = True) -> dict:
 
 
 def analyze_media(path: str, hashing: bool = True) -> dict:
+    from vault_purge.core.audio import AUDIO_EXTENSIONS, analyze_audio
     from vault_purge.core.video import VIDEO_EXTENSIONS, analyze_video
+    if Path(path).suffix.lower() in AUDIO_EXTENSIONS:
+        return analyze_audio(path, hashing)
     return analyze_video(path, hashing) if Path(path).suffix.lower() in VIDEO_EXTENSIONS else analyze_image(path, hashing)

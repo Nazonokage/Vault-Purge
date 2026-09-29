@@ -6,6 +6,9 @@ class SuspectedCorruption(ValueError):
 
 
 def failure_kind(error):
+    from vault_purge.core.media_tools import UnsupportedMedia
+    if isinstance(error, UnsupportedMedia):
+        return "unsupported"
     if isinstance(error, SuspectedCorruption):
         return "suspect"
     if isinstance(error, (PermissionError, FileNotFoundError, OSError)):

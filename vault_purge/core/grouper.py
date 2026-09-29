@@ -1,5 +1,7 @@
 from collections import defaultdict
+from bisect import bisect_left
 from vault_purge.core.resolver import recommend
+from vault_purge.core.audio import music_similarity
 
 
 class BKTree:
@@ -44,7 +46,7 @@ def group_images(records, threshold=10):
     trees = {"image": BKTree(), "video": BKTree()}
     near = {}
     for record in records:
-        if not record.phash:
+        if record.media_type == "audio" or not record.phash:
             continue
         value = int(record.phash, 16)
         tree = trees[record.media_type]
@@ -59,6 +61,23 @@ def group_images(records, threshold=10):
     for anchor_id, members in near.items():
         if len(members) > 1 and len({r.md5 or r.path for r in members}) > 1:
             groups.append(dict(id=f"near-{anchor_id}", kind="near", anchor_id=anchor_id, members=members, recommendation=recommend(members)))
+    audio_anchors = []
+    anchor_durations = []
+    for record in sorted((r for r in records if r.media_type == "audio" and r.audio_fingerprint), key=lambda r: (r.duration or 0, r.path)):
+        lower = bisect_left(anchor_durations, (record.duration or 0) - max(2, (record.duration or 0) * .02))
+        match = next(((anchor, members, evidence, score) for anchor, members, evidence in reversed(audio_anchors[lower:])
+                      if (score := music_similarity(anchor, record)) is not None), None)
+        if match:
+            anchor, members, evidence, score = match
+            members.append(record)
+            evidence[str(record.id)] = score
+        else:
+            audio_anchors.append((record, [record], {}))
+            anchor_durations.append(record.duration or 0)
+    for anchor, members, evidence in audio_anchors:
+        if len(members) > 1 and len({r.md5 or r.path for r in members}) > 1:
+            groups.append(dict(id=f"music-{anchor.id}", kind="near", anchor_id=anchor.id, members=members,
+                               evidence=evidence, recommendation=recommend(members)))
     return groups
 
 

@@ -136,4 +136,17 @@ def test_reveal_file_platform_support(tmp_path, monkeypatch):
     assert commands[-1] == ["xdg-open", str(test_file.resolve().parent)]
 
 
+def test_favicon_and_proactor_patch(tmp_path):
+    import sys
+    from vault_purge import patch_asyncio_windows_proactor
+    app = create_app(Settings(database=tmp_path / "favicon.sqlite3"))
+    with TestClient(app) as client:
+        res = client.get("/favicon.ico")
+        assert res.status_code == 204
+
+    # Test patch_asyncio_windows_proactor doesn't raise error
+    patch_asyncio_windows_proactor()
+
+
+
 

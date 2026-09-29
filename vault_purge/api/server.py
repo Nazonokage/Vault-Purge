@@ -1,4 +1,5 @@
 import secrets
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, delete
 from sqlmodel import Session, select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from vault_purge import __version__
 
 from vault_purge.api.settings import Settings
 from vault_purge.core.grouper import group_images
@@ -22,8 +24,14 @@ from vault_purge.storage.models import ImageRecord, MoveRecord, ScanRecord, Scan
 from vault_purge.utils.file_ops import execute_moves, preview_moves, recover_journal, restore_move, reveal_file, suggest_destination
 from vault_purge.utils.thumb_cache import thumbnail
 from vault_purge.utils.folders import browse_folders
+from vault_purge.core.playback import PreviewCache
+from vault_purge.core.deep_compare import SEGMENTS_VERSION, extract_segments, compare_segments
 
 SortOrder = Literal["name", "size_desc", "size_asc", "newest", "oldest", "blur", "duration"]
+
+
+def public_media(record):
+    return record.model_dump(exclude={"audio_fingerprint", "segments_json"})
 
 
 class ScanRequest(BaseModel):
@@ -48,6 +56,10 @@ class DestinationRequest(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=10000)
 
 
+class CompareRequest(BaseModel):
+    ids: list[int] = Field(min_length=2, max_length=2)
+
+
 class Preferences(BaseModel):
     dry_run: bool = True
     show_recommendation: bool = True
@@ -65,14 +77,17 @@ def create_app(settings: Settings | None = None):
     previews = {}
     job = {"state": "idle", "stats": None, "error": None, "scan_id": None}
     group_cache = {}
+    playback = PreviewCache(settings.database.resolve().parent / "previews")
+    comparison = {"state": "idle", "result": None, "error": None}
 
     @asynccontextmanager
     async def lifespan(app):
         yield
         pool.shutdown(wait=True)
+        playback.close()
         engine.dispose()
 
-    app = FastAPI(title="Image Dedup", lifespan=lifespan)
+    app = FastAPI(title="Vault Purge", version=__version__, lifespan=lifespan)
     app.state.engine = engine
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
 
@@ -144,7 +159,9 @@ def create_app(settings: Settings | None = None):
 
     @app.get("/api/scan")
     def scan_status():
-        return job.copy()
+        result = job.copy()
+        result["elapsed"] = round((time.monotonic() if job["state"] == "running" else job.get("finished", time.monotonic())) - job["started"], 1) if job.get("started") else 0
+        return result
 
     @app.post("/api/folders")
     def folders(path: str | None = None, offset: int = Query(0, ge=0)):
@@ -159,7 +176,7 @@ def create_app(settings: Settings | None = None):
         if not path.is_dir():
             raise HTTPException(400, "Choose an existing directory")
         require_lock()
-        job.update(state="running", stats=None, error=None, scan_id=None)
+        job.update(state="running", stats=None, error=None, scan_id=None, started=time.monotonic())
         invalidate()
 
         def run():
@@ -169,9 +186,10 @@ def create_app(settings: Settings | None = None):
                              progress=lambda stats: job.update(stats=stats.copy()),
                              on_started=lambda scan_id: job.update(scan_id=scan_id))
                 job.update(state="complete", stats=stats)
-            except Exception as exc:
-                job.update(state="error", error=str(exc))
+            except (Exception, KeyboardInterrupt) as exc:
+                job.update(state="error", error=str(exc) or "Scan interrupted because an analysis worker or the server was stopped. Scan again to continue using cached results.")
             finally:
+                job["finished"] = time.monotonic()
                 invalidate()
                 lock.release()
         pool.submit(run)
@@ -189,8 +207,8 @@ def create_app(settings: Settings | None = None):
     @app.get("/api/images")
     def images(orientation: str | None = None, status: str = "active", blurry: bool = False,
                scan_id: int | None = None,
-               integrity: Literal["unchecked", "checked", "sampled", "suspect", "unreadable"] | None = None,
-               root: str | None = None, media_type: Literal["image", "video"] | None = None,
+               integrity: Literal["unchecked", "checked", "sampled", "suspect", "unreadable", "unsupported"] | None = None,
+               root: str | None = None, media_type: Literal["image", "video", "audio"] | None = None,
                sort: SortOrder = "name", offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=200)):
         query = select(ImageRecord).where(ImageRecord.status == status)
         if scan_id is not None:
@@ -210,12 +228,12 @@ def create_app(settings: Settings | None = None):
                     "blur": ImageRecord.blur_score.asc().nulls_last(), "duration": ImageRecord.duration.desc().nulls_last()}[sort]
         with Session(engine) as session:
             total = session.exec(select(func.count()).select_from(query.subquery())).one()
-            return {"total": total, "items": session.exec(query.order_by(ordering, ImageRecord.path, ImageRecord.id).offset(offset).limit(limit)).all()}
+            return {"total": total, "items": [public_media(r) for r in session.exec(query.order_by(ordering, ImageRecord.path, ImageRecord.id).offset(offset).limit(limit))]}
 
     @app.get("/api/groups")
     def groups(root: str | None = None, kind: str | None = None, orientation: str | None = None,
                scan_id: int | None = None,
-               media_type: Literal["image", "video"] | None = None, sort: SortOrder = "name",
+               media_type: Literal["image", "video", "audio"] | None = None, sort: SortOrder = "name",
                offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
         if lock.locked():
             raise HTTPException(409, "Wait for the current operation to finish")
@@ -227,7 +245,7 @@ def create_app(settings: Settings | None = None):
                 if root:
                     query = query.where(ImageRecord.root == root)
                 result = group_images(session.exec(query).all(), settings.phash_threshold)
-                group_cache[key] = [{**g, "members": [r.model_dump() for r in g["members"]]} for g in result]
+                group_cache[key] = [{**g, "members": [public_media(r) for r in g["members"]]} for g in result]
         result = [g for g in group_cache[key] if (not kind or g["kind"] == kind)
                   and (not orientation or any(r["orientation"] == orientation for r in g["members"]))
                   and (not media_type or g["members"][0]["media_type"] == media_type)]
@@ -267,6 +285,97 @@ def create_app(settings: Settings | None = None):
             except Exception:
                 raise HTTPException(404, "Image unavailable; scan again")
             return Response(data, media_type="image/jpeg")
+
+    def playable_record(media_id):
+        with Session(engine) as session:
+            record = session.get(ImageRecord, media_id)
+            if not record or record.media_type not in {"video", "audio"} or record.status != "active":
+                raise HTTPException(404, "Available audio or video required")
+            path = Path(record.path)
+            try:
+                if path.is_symlink() or path.resolve() != path or fingerprint(path) != (record.size, record.mtime_ns, record.ctime_ns):
+                    raise ValueError("File changed; scan again")
+            except (OSError, ValueError) as exc:
+                raise HTTPException(409, str(exc))
+            return record, path
+
+    @app.get("/media/{media_id}")
+    def original_media(media_id: int):
+        record, path = playable_record(media_id)
+        return FileResponse(path)
+
+    @app.get("/api/compare")
+    def comparison_status():
+        return comparison.copy()
+
+    @app.post("/api/compare", status_code=202)
+    def start_comparison(body: CompareRequest):
+        if len(set(body.ids)) != 2:
+            raise HTTPException(400, "Select two different audio or video files")
+        require_lock()
+        try:
+            records = [playable_record(media_id)[0] for media_id in body.ids]
+            comparison.update(state="running", result=None, error=None)
+            def work():
+                try:
+                    segments = []
+                    for record in records:
+                        current, path = playable_record(record.id)
+                        if current.segments_json and current.segments_version == SEGMENTS_VERSION:
+                            data = json.loads(current.segments_json)
+                        else:
+                            data = extract_segments(path, current.media_type)
+                            playable_record(current.id)  # Reject analysis of a changed source.
+                            with Session(engine) as session:
+                                row = session.get(ImageRecord, current.id)
+                                row.segments_json = json.dumps(data)
+                                row.segments_version = SEGMENTS_VERSION
+                                session.add(row)
+                                session.commit()
+                        segments.append(data)
+                    result = compare_segments(*segments, records[0].duration, records[1].duration)
+                    for record in records:
+                        playable_record(record.id)
+                    result["files"] = [dict(id=r.id, path=r.path) for r in records]
+                    comparison.update(state="complete", result=result)
+                except Exception as exc:
+                    comparison.update(state="error", error=str(exc))
+                finally:
+                    lock.release()
+            pool.submit(work)
+        except Exception:
+            lock.release()
+            raise
+        return {"state": "running"}
+
+    @app.post("/api/media/{media_id}/preview")
+    def prepare_playback(media_id: int):
+        record, path = playable_record(media_id)
+        try:
+            key, status = playback.request(path, record.media_type, record.duration)
+            return {"key": key, "state": status["state"], "error": status["error"]}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/media/{media_id}/preview/{key}")
+    def playback_status(media_id: int, key: str):
+        record, path = playable_record(media_id)
+        if key != playback.key(path, record.media_type):
+            raise HTTPException(409, "Preview source changed; prepare it again")
+        status = playback.status(key)
+        if not status:
+            raise HTTPException(404, "Preview unavailable")
+        return {"state": status["state"], "error": status["error"], "url": f"/media/{media_id}/preview/{key}" if status["state"] == "ready" else None}
+
+    @app.get("/media/{media_id}/preview/{key}")
+    def serve_playback(media_id: int, key: str):
+        record, path = playable_record(media_id)
+        if key != playback.key(path, record.media_type):
+            raise HTTPException(409, "Preview source changed")
+        status = playback.status(key)
+        if not status or status["state"] != "ready":
+            raise HTTPException(404, "Preview unavailable")
+        return FileResponse(status["path"], media_type="video/mp4" if record.media_type == "video" else "audio/mp4")
 
     @app.post("/api/move/preview")
     def preview(body: PreviewRequest):
@@ -367,8 +476,13 @@ def create_app(settings: Settings | None = None):
     static = Path(__file__).resolve().parents[1] / "ui" / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        return Response(status_code=204)
+
     @app.get("/")
     def index():
         return FileResponse(static / "index.html")
 
     return app
+

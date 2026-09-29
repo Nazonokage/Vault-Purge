@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_PORT = 47831
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="vault_purge_", env_file=".env", extra="ignore")

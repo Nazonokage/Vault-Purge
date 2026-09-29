@@ -23,6 +23,14 @@ class ImageRecord(SQLModel, table=True):
     fps: float | None = None
     frame_hashes: str | None = None
     integrity: str = "unchecked"
+    codec: str | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    audio_fingerprint: str | None = None
+    audio_version: int = 0
+    analysis_note: str | None = None
+    segments_json: str | None = None
+    segments_version: int = 0
 
 
 class MoveRecord(SQLModel, table=True):
