@@ -32,7 +32,7 @@ class BKTree:
             stack.extend(child for edge, child in node[2].items() if distance - threshold <= edge <= distance + threshold)
 
 
-def group_images(records, threshold=10):
+def group_images(records, threshold=10, video_threshold=None):
     records = sorted((r for r in records if r.status == "active"), key=lambda r: r.path)
     exact = defaultdict(list)
     for record in records:
@@ -50,8 +50,9 @@ def group_images(records, threshold=10):
             continue
         value = int(record.phash, 16)
         tree = trees[record.media_type]
-        candidates = [candidate for candidate in tree.find(value, threshold)
-                      if record.media_type != "video" or videos_match(record, candidate, threshold)]
+        distance_limit = video_threshold if record.media_type == "video" and video_threshold is not None else threshold
+        candidates = [candidate for candidate in tree.find(value, distance_limit)
+                      if record.media_type != "video" or videos_match(record, candidate, distance_limit)]
         if candidates:
             anchor = min(candidates, key=lambda a: ((value ^ int(a.phash, 16)).bit_count(), a.path))
             near[anchor.id].append(record)

@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import func, delete
+from sqlalchemy import func, delete, case
 from sqlmodel import Session, select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from vault_purge import __version__
@@ -65,6 +65,8 @@ class Preferences(BaseModel):
     show_recommendation: bool = True
     phash_threshold: int = Field(default=10, ge=0, le=20)
     blur_threshold: float = Field(default=100, ge=0)
+    video_phash_threshold: int | None = Field(default=None, ge=0, le=20)
+    video_blur_threshold: float | None = Field(default=None, ge=0)
 
 
 def create_app(settings: Settings | None = None):
@@ -144,13 +146,25 @@ def create_app(settings: Settings | None = None):
 
     @app.get("/api/settings")
     def get_settings():
-        return {**settings.model_dump(mode="json"), "session_token": token}
+        return {**settings.model_dump(mode="json"), "session_token": token,
+                "capabilities": {"review_priority": True},
+                "video_phash_threshold": video_threshold(), "video_blur_threshold": video_blur()}
+
+    def video_threshold():
+        return settings.video_phash_threshold if settings.video_phash_threshold is not None else settings.phash_threshold
+
+    def video_blur():
+        return settings.video_blur_threshold if settings.video_blur_threshold is not None else settings.blur_threshold
+
+    def blurry_condition():
+        return (((ImageRecord.media_type == "image") & (ImageRecord.blur_score < settings.blur_threshold)) |
+                ((ImageRecord.media_type == "video") & (ImageRecord.blur_score < video_blur())))
 
     @app.put("/api/settings")
     def put_settings(preferences: Preferences):
         require_lock()
         try:
-            for key, value in preferences.model_dump().items():
+            for key, value in preferences.model_dump(exclude_unset=True).items():
                 setattr(settings, key, value)
             invalidate()
             return get_settings()
@@ -201,7 +215,7 @@ def create_app(settings: Settings | None = None):
             condition = scan_filter(scan_id) if scan_id is not None else True
             counts = dict(session.exec(select(ImageRecord.status, func.count()).where(condition).group_by(ImageRecord.status)).all())
             roots = session.exec(select(ImageRecord.root).where(condition).distinct()).all()
-            blurry = session.exec(select(func.count()).select_from(ImageRecord).where(condition, ImageRecord.status == "active", ImageRecord.blur_score < settings.blur_threshold)).one()
+            blurry = session.exec(select(func.count()).select_from(ImageRecord).where(condition, ImageRecord.status == "active", blurry_condition())).one()
             return {"counts": counts, "roots": roots, "blurry": blurry}
 
     @app.get("/api/images")
@@ -209,8 +223,9 @@ def create_app(settings: Settings | None = None):
                scan_id: int | None = None,
                integrity: Literal["unchecked", "checked", "sampled", "suspect", "unreadable", "unsupported"] | None = None,
                root: str | None = None, media_type: Literal["image", "video", "audio"] | None = None,
-               sort: SortOrder = "name", offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=200)):
-        query = select(ImageRecord).where(ImageRecord.status == status)
+               sort: SortOrder = "name", review_first: bool = False,
+               offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=200)):
+        query = select(ImageRecord).where(ImageRecord.status.in_(["active", "error"]) if status == "all" else ImageRecord.status == status)
         if scan_id is not None:
             query = query.where(scan_filter(scan_id))
         if orientation:
@@ -218,7 +233,7 @@ def create_app(settings: Settings | None = None):
         if root:
             query = query.where(ImageRecord.root == root)
         if blurry:
-            query = query.where(ImageRecord.blur_score < settings.blur_threshold)
+            query = query.where(blurry_condition())
         if media_type:
             query = query.where(ImageRecord.media_type == media_type)
         if integrity:
@@ -226,27 +241,42 @@ def create_app(settings: Settings | None = None):
         ordering = {"name": ImageRecord.path, "size_desc": ImageRecord.size.desc(), "size_asc": ImageRecord.size,
                     "newest": ImageRecord.mtime_ns.desc(), "oldest": ImageRecord.mtime_ns,
                     "blur": ImageRecord.blur_score.asc().nulls_last(), "duration": ImageRecord.duration.desc().nulls_last()}[sort]
+        duplicate_kinds = {}
+        if review_first and status in {"all", "active"}:
+            for group in cached_groups(root, scan_id):
+                for member in group["members"]:
+                    if duplicate_kinds.get(member["id"]) != "exact":
+                        duplicate_kinds[member["id"]] = group["kind"]
+        ordering_columns = [ordering, ImageRecord.path, ImageRecord.id]
+        if review_first:
+            ordering_columns.insert(0, case((ImageRecord.status == "error", 0),
+                                            (ImageRecord.id.in_(duplicate_kinds), 1), else_=2))
         with Session(engine) as session:
             total = session.exec(select(func.count()).select_from(query.subquery())).one()
-            return {"total": total, "items": [public_media(r) for r in session.exec(query.order_by(ordering, ImageRecord.path, ImageRecord.id).offset(offset).limit(limit))]}
+            rows = session.exec(query.order_by(*ordering_columns).offset(offset).limit(limit))
+            return {"total": total, "items": [dict(public_media(r), duplicate_kind=duplicate_kinds.get(r.id))
+                                               if review_first else public_media(r) for r in rows]}
+
+    def cached_groups(root, scan_id):
+        if lock.locked():
+            raise HTTPException(409, "Wait for the current operation to finish")
+        condition = scan_filter(scan_id) if scan_id is not None else True
+        key = (root, settings.phash_threshold, video_threshold(), scan_id)
+        if key not in group_cache:
+            with Session(engine) as session:
+                query = select(ImageRecord).where(ImageRecord.status == "active", condition)
+                if root:
+                    query = query.where(ImageRecord.root == root)
+                result = group_images(session.exec(query).all(), settings.phash_threshold, video_threshold())
+                group_cache[key] = [{**g, "members": [public_media(r) for r in g["members"]]} for g in result]
+        return group_cache[key]
 
     @app.get("/api/groups")
     def groups(root: str | None = None, kind: str | None = None, orientation: str | None = None,
                scan_id: int | None = None,
                media_type: Literal["image", "video", "audio"] | None = None, sort: SortOrder = "name",
                offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
-        if lock.locked():
-            raise HTTPException(409, "Wait for the current operation to finish")
-        condition = scan_filter(scan_id) if scan_id is not None else True
-        key = (root, settings.phash_threshold, scan_id)
-        if key not in group_cache:
-            with Session(engine) as session:
-                query = select(ImageRecord).where(ImageRecord.status == "active", condition)
-                if root:
-                    query = query.where(ImageRecord.root == root)
-                result = group_images(session.exec(query).all(), settings.phash_threshold)
-                group_cache[key] = [{**g, "members": [public_media(r) for r in g["members"]]} for g in result]
-        result = [g for g in group_cache[key] if (not kind or g["kind"] == kind)
+        result = [g for g in cached_groups(root, scan_id) if (not kind or g["kind"] == kind)
                   and (not orientation or any(r["orientation"] == orientation for r in g["members"]))
                   and (not media_type or g["members"][0]["media_type"] == media_type)]
         def sort_group(group):
@@ -417,9 +447,13 @@ def create_app(settings: Settings | None = None):
             lock.release()
 
     @app.get("/api/moves")
-    def moves(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    def moves(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200), paginated: bool = False):
         with Session(engine) as session:
-            return session.exec(select(MoveRecord).order_by(MoveRecord.id.desc()).offset(offset).limit(limit)).all()
+            rows = session.exec(select(MoveRecord).order_by(MoveRecord.id.desc()).offset(offset).limit(limit)).all()
+            if paginated:
+                total = session.exec(select(func.count()).select_from(MoveRecord)).one()
+                return {"total": total, "items": rows}
+            return rows
 
     @app.post("/api/moves/{move_id}/restore")
     def restore(move_id: int, body: ConfirmRequest):

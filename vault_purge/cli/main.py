@@ -18,12 +18,12 @@ app = typer.Typer(no_args_is_help=True, help="Find duplicate images, videos, and
 console = Console()
 
 
-def show_report(engine, root=None, threshold=10):
+def show_report(engine, root=None, threshold=10, video_threshold=None):
     with Session(engine) as session:
         query = select(ImageRecord).where(ImageRecord.status == "active")
         if root:
             query = query.where(ImageRecord.root == str(root.resolve()))
-        groups = group_images(session.exec(query).all(), threshold)
+        groups = group_images(session.exec(query).all(), threshold, video_threshold)
     table = Table("Kind", "Files", "Suggested keeper", "Reason")
     for group in groups:
         winner = next(r for r in group["members"] if r.id == group["recommendation"]["id"])
@@ -50,7 +50,7 @@ def scan(path: Annotated[Path, typer.Option(exists=True, file_okay=False, help="
             result = scan_folder(path, engine, settings.workers, classify_only, recursive, force,
                                  lambda stats: status.update(f"Analyzed {stats['analyzed']} · cached {stats['cached']} · errors {stats['errors']}"))
         console.print(result)
-        show_report(engine, path, settings.phash_threshold)
+        show_report(engine, path, settings.phash_threshold, settings.video_phash_threshold)
     finally:
         engine.dispose()
     if serve:
@@ -82,7 +82,7 @@ def report(database: Path | None = None, path: Path | None = None, output: Path 
     settings = Settings()
     engine = open_database(database or settings.database)
     try:
-        groups = show_report(engine, path, settings.phash_threshold)
+        groups = show_report(engine, path, settings.phash_threshold, settings.video_phash_threshold)
         if output:
             output.write_text(json.dumps([{**g, "members": [r.model_dump() for r in g["members"]]} for g in groups], indent=2), encoding="utf-8")
             console.print(f"Saved {output}")

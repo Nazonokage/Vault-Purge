@@ -82,14 +82,45 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
     if not root.is_dir():
         raise ValueError("Scan path must be a directory")
     stats = dict(found=0, cached=0, analyzed=0, errors=0)
+    stage = "discovery"
+    total = None
     def report():
         if progress:
-            progress(stats.copy())
+            progress({**stats, "stage": stage, "total": total,
+                      "processed": stats["cached"] + stats["analyzed"] + stats["errors"]})
     report()
     seen = set()
     with Session(engine) as session:
         previous = {r.path: r for r in session.exec(select(ImageRecord).where(ImageRecord.root == str(root)))}
         excluded = {Path(m.destination).resolve() for m in session.exec(select(MoveRecord).where(MoveRecord.state != "restored"))}
+        # Discover once, retaining paths rather than walking the directory again.
+        paths = []
+        for path in walk_images(root, excluded, recursive):
+            paths.append(path)
+            stats["found"] += 1
+            report()
+        total = stats["found"]
+        stage = "processing"
+        report()
+        pending = []
+        for path in paths:
+            seen.add(str(path))
+            try:
+                signature = fingerprint(path)
+            except OSError:
+                stats["errors"] += 1
+                report()
+                continue
+            record = previous.get(str(path)) or session.exec(select(ImageRecord).where(ImageRecord.path == str(path))).first()
+            if record and not force and record.status == "active" and record.version == ANALYSIS_VERSION and (record.size, record.mtime_ns, record.ctime_ns) == signature and (classify_only or analysis_complete(record)):
+                record.root = str(root)
+                session.add(record)
+                session.add(ScanMember(scan_id=scan_id, image_id=record.id))
+                stats["cached"] += 1
+                report()
+                continue
+            pending.append((path, signature, record))
+        session.commit()
         # Bound submitted work to a small batch, including decoded worker images.
         with ThreadPoolExecutor(max_workers=min(8, workers * 2)) as io_pool, ProcessPoolExecutor(max_workers=workers) as cpu_pool:
             batch = []
@@ -120,29 +151,11 @@ def _scan(root: Path, engine, workers, classify_only, recursive, force, progress
                     session.add(record)
                     session.flush()
                     session.add(ScanMember(scan_id=scan_id, image_id=record.id))
-                    if progress:
-                        progress(stats)
+                    report()
                 session.commit()
                 batch.clear()
 
-            for path in walk_images(root, excluded, recursive):
-                stats["found"] += 1
-                report()
-                seen.add(str(path))
-                try:
-                    signature = fingerprint(path)
-                except OSError:
-                    stats["errors"] += 1
-                    report()
-                    continue
-                record = previous.get(str(path)) or session.exec(select(ImageRecord).where(ImageRecord.path == str(path))).first()
-                if record and not force and record.status == "active" and record.version == ANALYSIS_VERSION and (record.size, record.mtime_ns, record.ctime_ns) == signature and (classify_only or analysis_complete(record)):
-                    record.root = str(root)
-                    session.add(record)
-                    session.add(ScanMember(scan_id=scan_id, image_id=record.id))
-                    stats["cached"] += 1
-                    report()
-                    continue
+            for path, signature, record in pending:
                 if record is None:
                     record = ImageRecord(root=str(root), path=str(path), size=signature[0], mtime_ns=signature[1], ctime_ns=signature[2])
                 record.root = str(root)

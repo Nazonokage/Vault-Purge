@@ -1,4 +1,4 @@
-# Vault Purge v1.2
+# Vault Purge v1.3
 
 Local image, video, and audio duplicate review with cached analysis and reversible moves. Python 3.11+, FastAPI, SQLite, Pillow, ImageHash, and OpenCV.
 
@@ -91,12 +91,17 @@ The app opens with an empty view on every page load. It does not automatically s
 History saves scan membership and summary counts, not immutable copies of files or measurements. Opening an older scan shows those files' latest cached details and current move status. Reconnect removable drives to load their thumbnails or act on their files. Caches from older versions appear as imported history with an unknown original scan date.
 
 - **Duplicate groups:** exact and possible matches remain separate. Every possible-group member matches its anchor; members need not match each other. A file can appear in both exact and possible groups.
+- **Result tabs:** use **Duplicates**, **All media**, or **Errors** beside Grid/List. After each scan, the review queue opens and scrolls into view. With no duplicates, scans open Errors if any files failed, otherwise All media. The Errors tab shows an error count and ignores orientation/blur filters so failed metadata cannot hide error records.
+- **Media dropdowns:** expandable Images, Audio, and Videos sections each keep their own filters and sort order. Opening one selects that media type. Audio omits orientation and sharpness controls.
+- **All media priority:** includes available files and scan errors by default. Errors appear first, then exact/possible duplicate-group members, then remaining files. The selected sort applies within each priority, before pagination. Cards label errors and duplicate candidates; moved and missing files remain available through explicit status filters.
 - **All media:** filter by images/videos/audio, scanned folder, orientation, status, and potential blur.
 - **Sort:** path A–Z, size, modification date, lowest sharpness, or longest duration. Group size sorting uses total group bytes; group date sorting uses the newest/oldest member. Sorting happens before pagination.
-- **Suggested keep:** images/videos use resolution, file size, oldest modification time, then path. Audio uses oldest modification time, then path; this is a stable suggestion, not an audio-quality ranking. The suggestion never selects files or initiates a move.
+- **Suggested keep:** images/videos use resolution, file size, oldest modification time, then path. Audio uses oldest modification time, then path; this is a stable suggestion, not an audio-quality ranking. Duplicate groups pre-select every available copy except suggested keepers on the current page. Groups without a suggestion stay unselected; keepers in overlapping groups are protected. Turn off **Pre-select duplicates** to select manually. Suggestions never initiate a move.
 - **Show in folder:** click on any active/suspect media card or move history record to reveal and highlight the file in your system file manager (Explorer / Finder / Linux).
 - **Grid / List view:** toggle between grid view and compact detailed list view with smaller thumbnails.
-- Select files manually, choose **Preview moves**, and review the source and destination list.
+- Click a card or press Space/Enter to toggle selection; the checkbox and inner buttons also work independently. **Select all on page**, **Clear selection**, and automatic pre-selection affect the displayed page. Cards show folder paths, with differing folder components highlighted and full paths on hover.
+- Choose **Move selected** and review the source and destination list. Completed moves immediately leave the results; groups with fewer than two available files disappear, and pages refill. Restoring from History rebuilds eligible groups.
+- **Move history** has exact page counts and page-scoped selection for confirmed bulk restore. Only completed moves can be selected for restore.
 - **Preview only** is on by default. To move files, turn it off in Review settings, build a fresh preview, and confirm. Restores also require it to be off.
 
 Relative backup paths are resolved inside each file's scanned root and preserve its relative folder structure. Existing destination files are never overwritten. Files are copied to an exclusively created destination, verified, then removed from the original location. This also works across drives but temporarily requires room for the copy.
@@ -121,7 +126,7 @@ File hashing uses threads; image/video analysis uses a process pool with bounded
 
 ## Scan feedback, audio, and playback
 
-Scans show an animated activity strip, elapsed time, and found/analyzed/cached/error counters. Cache-only scans also report progress. The strip is indeterminate because directory discovery is incremental. Reduced-motion preferences disable its animation. Results preparation is a separate state; no percentage or completion estimate is invented.
+Scans first discover files with a live found count and an indeterminate page-flip loader. A single directory walk supplies the total; processing then shows processed/total, a monotonic percentage, elapsed time, cache/error counts, and a rough time remaining once measured work is available. Cached files count as complete before new analysis starts. Results preparation returns to indeterminate activity. Reduced-motion preferences show a static book, status announcements are throttled outside the animation, and the loader stops on completion or failure.
 
 Audio extensions: MP3, FLAC, WAV, M4A, OGG, Opus, AAC, WMA, AIFF/AIF. Full audio scans decode every audio stream for integrity checking, within a two-hour processing timeout. Metadata includes the first audio stream's codec, sample rate, channels, and duration. Decoder errors are review evidence, not proof of corruption; explicit unsupported-codec and access errors are distinguished. Fingerprinting failure does not invalidate a successful integrity check. Audio supports the existing exact-copy, quarantine-review, move, and restore workflows.
 
@@ -161,11 +166,13 @@ Environment variables or `.env`, prefixed `vault_purge_`:
 | DEST_FOLDER | `_duplicates_backup` |
 | SHOW_RECOMMENDATION | `true` |
 | WORKERS | CPU count capped at 4 |
-| PHASH_THRESHOLD | `10` (0–20; lower is stricter) |
-| BLUR_THRESHOLD | `100` |
+| PHASH_THRESHOLD | `10` (image matching; 0–20; lower is stricter) |
+| VIDEO_PHASH_THRESHOLD | Inherits PHASH_THRESHOLD until set |
+| BLUR_THRESHOLD | `100` (images) |
+| VIDEO_BLUR_THRESHOLD | Inherits BLUR_THRESHOLD until set |
 | THUMB_SIZE | `320` |
 
-Review settings in the GUI last for the current server session. The app binds to loopback, checks host/origin, and requires a session token for mutation and folder-browsing requests. It is intended as a single-user local tool, not a publicly hosted service.
+Review settings are grouped into General, Images, Audio, and Videos dropdowns. Image and video similarity/blur thresholds are independent. Audio describes its fixed fingerprint matching rules. Review settings in the GUI last for the current server session. The app binds to loopback, checks host/origin, and requires a session token for mutation and folder-browsing requests. It is intended as a single-user local tool, not a publicly hosted service.
 
 ## Development and validation
 
@@ -174,6 +181,7 @@ Unexpected shutdowns: server launches write `diagnostics.log` beside the configu
 ```powershell
 uv sync
 uv run pytest -q
+node --test tests/test_ui.cjs
 ```
 
 Tests generate their own media and exercise decoding, EXIF orientation, blur scoring, cache hits/invalidation, corrupt and missing files, grouping, migration, sorting, directory browsing, and reversible file operations. No personal media is needed.

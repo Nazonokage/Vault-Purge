@@ -142,7 +142,8 @@ def test_empty_scan_reports_completion(tmp_path, engine):
     folder = tmp_path / 'empty'; folder.mkdir()
     updates = []
     assert scan(folder, engine, workers=1, progress=updates.append)['found'] == 0
-    assert updates and updates[-1] == dict(found=0, cached=0, analyzed=0, errors=0)
+    assert updates and updates[-1] == dict(found=0, cached=0, analyzed=0, errors=0,
+                                          stage='processing', total=0, processed=0)
 
 
 def test_video_preview_and_deep_api_cache(audio, tmp_path, monkeypatch):

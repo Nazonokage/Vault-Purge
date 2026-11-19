@@ -105,7 +105,8 @@ def test_schema_upgrade_preserves_rows(tmp_path):
         session.add(record(1));session.commit()
     engine.dispose()
     with sqlite3.connect(path) as connection:
-        connection.execute('DROP INDEX ix_imagerecord_media_type')
+        for idx in ('ix_imagerecord_media_type', 'ix_imagerecord_status_type', 'ix_imagerecord_status_blur'):
+            connection.execute(f'DROP INDEX IF EXISTS {idx}')
         for name in ('media_type','duration','fps','frame_hashes','integrity'):
             connection.execute(f'ALTER TABLE imagerecord DROP COLUMN {name}')
         connection.execute('PRAGMA user_version=1')

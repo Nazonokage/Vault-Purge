@@ -16,4 +16,6 @@ class Settings(BaseSettings):
     workers: int = Field(default=min(4, os.cpu_count() or 1), ge=1, le=61)
     phash_threshold: int = Field(default=10, ge=0, le=20)
     blur_threshold: float = Field(default=100.0, ge=0)
+    video_phash_threshold: int | None = Field(default=None, ge=0, le=20)
+    video_blur_threshold: float | None = Field(default=None, ge=0)
     thumb_size: int = Field(default=320, ge=64, le=1024)

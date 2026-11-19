@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.3.0] - 2026-11-19
+
+- Release validation: 47 Python tests and 17 Node UI tests passed.
+
+- Keep the result tabs and Grid/List controls visible while scrolling. Orientation controls appear only under Images and Videos.
+- Detect an older running server instead of silently displaying an empty All media list after a frontend update.
+- Add RAM-scaled SQLite memory settings and indexes for media-status and blur filtering.
+
+- All media now includes errors by default and orders errors before duplicate candidates and remaining files across pages, with the chosen sort inside each priority. Cards show error/duplicate badges; duplicate status updates after moves and restores.
+
+- Grouped filters and review settings into Images, Audio, and Videos dropdowns, retaining separate per-type filter choices and independent image/video similarity and blur thresholds.
+- Added Duplicates, All media, and Errors tabs beside Grid/List, including an error count. Scans always reveal results; scans without duplicates open Errors when present, otherwise All media. Error browsing ignores orientation and blur filters.
+
+- Added page-scoped duplicate pre-selection with keeper protection, a toolbar toggle, select-all/clear controls, clickable cards, and Space/Enter support.
+- Added folder metadata with middle truncation, full hover paths, and highlighted differing components.
+- Keep the results view after moves, remove singleton groups, and repair pagination when the final page shrinks; restore rebuilds eligible groups.
+- Added exact move-history totals and page-scoped selection for confirmed bulk restore, retaining the existing list API for older clients.
+- Added single-walk discovery followed by real processing percentages, immediate cache accounting, a rough remaining-time estimate, throttled accessible status, and a reduced-motion page-flip loader.
+- Added generated 4,000-file scan and 4,001-entry History tests, failure/interruption coverage, move/restore cleanup checks, and Node-based UI regressions.
+
 ## [1.2.0] - 2026-09-29
 
 - Changed the default local port from 8000 to 47831 for both `serve` and `scan --serve`; custom `--port` remains supported.
